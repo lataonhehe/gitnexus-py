@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.deps import settings_dep
 from app.config import Settings
@@ -10,8 +10,8 @@ router = APIRouter(tags=["health"])
 
 
 @router.get("/health")
-def health(settings: Annotated[Settings, Depends(settings_dep)]):
-    return {"status": "ok", "app": settings.app_name}
+def health():
+    return {"status": "ok"}
 
 
 @router.get("/ready")
@@ -20,8 +20,13 @@ def ready(settings: Annotated[Settings, Depends(settings_dep)]):
         return {"status": "ready", "neo4j": "skipped"}
     driver = get_driver(settings)
     if driver is None:
-        return {"status": "not_ready", "neo4j": "not_configured"}
-    ok = verify_connectivity(driver)
-    if ok:
-        return {"status": "ready", "neo4j": "ok"}
-    return {"status": "not_ready", "neo4j": "unreachable"}
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"status": "not_ready", "neo4j": "not_configured"},
+        )
+    if verify_connectivity(driver):
+        return {"status": "ready", "neo4j": "connected"}
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={"status": "not_ready", "neo4j": "unreachable"},
+    )

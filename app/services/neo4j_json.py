@@ -4,6 +4,22 @@ from __future__ import annotations
 
 from typing import Any
 
+from neo4j.graph import Node, Path, Relationship
+
+
+def json_cell(v: Any) -> Any:
+    """Serialize a single Cypher result cell (Node/Relationship → JSON dict)."""
+    if isinstance(v, Node):
+        return {k: simplify_value(x) for k, x in dict(v).items()}
+    if isinstance(v, Relationship):
+        return {
+            "type": v.type,
+            **{k: simplify_value(x) for k, x in dict(v).items()},
+        }
+    if isinstance(v, Path):
+        return str(v)
+    return simplify_value(v)
+
 
 def simplify_value(v: Any) -> Any:
     if v is None:

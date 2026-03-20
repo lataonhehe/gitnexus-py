@@ -5,11 +5,20 @@ from pathlib import Path
 
 import pathspec
 
+from app.config import get_settings
+
 
 def safe_repo_root(raw: str) -> Path:
     p = Path(raw).expanduser().resolve()
     if not p.exists() or not p.is_dir():
         raise ValueError(f"Repository root is not a directory: {p}")
+    allow = get_settings().repo_roots_allowlist
+    if allow:
+        roots = [Path(x).expanduser().resolve() for x in allow]
+        if not any(p == r or r in p.parents for r in roots):
+            raise ValueError(
+                "Repository root is not under GITNEXUS_REPO_ROOTS_ALLOWLIST paths.",
+            )
     return p
 
 

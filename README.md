@@ -1,13 +1,11 @@
 # gitnexus-py
 
-Backend kiểu **GitNexus** bằng Python: **FastAPI** + **Neo4j** + **tree-sitter** (Python). Đăng ký repo, index mã nguồn lên đồ thị, rồi truy vấn **Cypher** (read-only, có giới hạn) và **context** quanh symbol (callers/callees/imports).
-
-Trạng triển khai theo [`plan.md`](plan.md): đã có tới **Phase 3** (skeleton, indexer, read API). Các tính năng Phase 4+ (BM25/RRF, impact, git diff, rename, …) nằm trong roadmap, chưa có trong code.
+Backend kiểu **GitNexus** bằng Python: **FastAPI** + **Neo4j** + **tree-sitter** (Python). Đăng ký repo, index mã nguồn lên đồ thị (Function / Class / Method, CALLS, IMPORTS, CONTAINS), rồi điều hướng codebase qua API theo [`plan_phase1_3.md`](plan_phase1_3.md).
 
 ## Yêu cầu
 
 - Python **3.10+**
-- **Docker** (Neo4j; Redis tùy chọn)
+- **Docker** (Neo4j; Redis tùy chọn, profile `workers`)
 
 ## Cài đặt
 
@@ -21,24 +19,24 @@ pip install -e ".[dev]"
 docker compose up -d neo4j
 ```
 
-Mặc định trong `docker-compose.yml`: **Bolt** `bolt://localhost:7687`, user `neo4j`, password `gitnexus-dev`.
+Mặc định: Bolt `bolt://localhost:7687`, user `neo4j`, password `gitnexus-dev` (khớp `docker-compose.yml`).
 
 ## Cấu hình
 
-Tạo file **`.env`** ở thư mục gốc dự án hoặc export biến môi trường. Tất cả biến dùng tiền tố **`GITNEXUS_`** (xem [`app/config.py`](app/config.py)).
+Tạo **`.env`** từ [`.env.example`](.env.example). Biến chính dùng tiền tố **`GITNEXUS_`** (xem [`app/config.py`](app/config.py)).
 
 | Biến | Mặc định | Ý nghĩa |
 |------|----------|---------|
-| `GITNEXUS_NEO4J_URI` | *(trống)* | Ví dụ `bolt://localhost:7687` |
+| `GITNEXUS_NEO4J_URI` | *(trống)* | `bolt://localhost:7687` |
 | `GITNEXUS_NEO4J_USER` | `neo4j` | User Neo4j |
 | `GITNEXUS_NEO4J_PASSWORD` | `gitnexus-dev` | Mật khẩu |
-| `GITNEXUS_NEO4J_ENABLED` | `true` | `false`: `/ready` bỏ qua DB; API đồ thị trả 503 nếu cần driver |
-| `GITNEXUS_LOG_LEVEL` | `INFO` | Mức log |
-| `GITNEXUS_DATA_DIR` | `./data` | Thư mục dữ liệu cục bộ (cache/index sau này) |
+| `GITNEXUS_NEO4J_DATABASE` | `neo4j` | Tên database Neo4j |
+| `GITNEXUS_NEO4J_ENABLED` | `true` | `false`: `/ready` bỏ qua DB |
+| `GITNEXUS_REPO_ROOTS_ALLOWLIST` | *(trống)* | Danh sách root được phép index (CSV); rỗng = không hạn chế |
+| `GITNEXUS_LOG_LEVEL` | `INFO` | Log (JSON qua structlog) |
+| `GITNEXUS_CYPHER_MAX_ROWS` | `1000` | Giới hạn dòng Cypher |
 | `GITNEXUS_CYPHER_TIMEOUT_SECONDS` | `30` | Timeout Cypher |
-| `GITNEXUS_CYPHER_MAX_ROWS` | `5000` | Giới hạn số dòng trả về |
-| `GITNEXUS_CYPHER_READ_ONLY` | `true` | Chỉ cho truy vấn read (guard) |
-| `GITNEXUS_REDIS_URL` | *(trống)* | Dự phòng cho worker sau này |
+| `GITNEXUS_CYPHER_READ_ONLY` | `true` | Guard read-only |
 
 ## Chạy API
 
@@ -46,43 +44,38 @@ Tạo file **`.env`** ở thư mục gốc dự án hoặc export biến môi tr
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-- **OpenAPI / Swagger UI:** [http://localhost:8000/docs](http://localhost:8000/docs)
-- `GET /health` — process còn sống
-- `GET /ready` — kết nối Neo4j (hoặc `skipped` nếu tắt Neo4j)
+- OpenAPI: [http://localhost:8000/docs](http://localhost:8000/docs)
+- `GET /health` — liveness
+- `GET /ready` — readiness (Neo4j); **503** nếu không kết nối được
 
-## Đăng ký và index repo
-
-Thay `C:/path/to/repo` bằng đường dẫn thật tới root git clone.
+## Đăng ký và index (Phase 2–3)
 
 ```bash
-curl -X POST http://localhost:8000/repos -H "Content-Type: application/json" -d "{\"id\":\"demo\",\"name\":\"Demo\",\"root_path\":\"C:/path/to/repo\"}"
-curl -X POST http://localhost:8000/repos/demo/index -H "Content-Type: application/json" -d "{\"full\":true}"
+# Đăng ký + index full (mặc định trigger_index=true). id slug từ name nếu không gửi id.
+curl -X POST http://localhost:8000/repos -H "Content-Type: application/json" ^
+  -d "{\"name\":\"my-project\",\"path\":\"C:/path/to/repo\"}"
+
+curl http://localhost:8000/repos/my-project
+curl -X POST http://localhost:8000/repos/my-project/reindex
 ```
 
-- `GET /repos` — danh sách repo đã đăng ký
-- `GET /repos/{repo_id}/schema` — mô tả label / quan hệ đồ thị (hỗ trợ MCP / tài liệu)
+- `GET /repos` — `{ "repos": [ { id, name, root_path, status, stats: { file_count, symbol_count, edge_count }, ... } ] }`
+- `DELETE /repos/{repo_id}` — gỡ đăng ký và xóa đồ thị có `repo_id`
+- `GET /repos/{repo_id}/schema` — schema cho MCP / tài liệu (plan 3b)
 
-## API hiện có (Phase 3)
+### Read API (Phase 3)
 
 | Method | Path | Mô tả |
 |--------|------|--------|
-| POST | `/cypher` | Cypher read-only, có guard, timeout, giới hạn dòng |
-| POST | `/context` | Một symbol → callers / callees / imports (+ disambiguation bằng `uid` / `file_path`) |
-
-## Redis (tùy chọn)
-
-```bash
-docker compose --profile workers up -d
-```
-
-Dùng cho worker nền sau này; **không bắt buộc** cho Phase 3.
+| POST | `/repos/{repo_id}/cypher` | Cypher read-only; body `{ "query", "parameters"? }`; lỗi guard → **403** `CYPHER_FORBIDDEN` |
+| POST | `/repos/{repo_id}/context` | Context symbol: `name`, `uid?`, `file_path?`, `depth` (1–8); disambiguation khi trùng tên |
 
 ## Hạn chế
 
-- Index hiện chỉ **Python** (`.py`).
-- Các endpoint roadmap (`/query`, `/impact`, git diff, rename, …) chưa triển khai — xem [`plan.md`](plan.md).
+- Index v1 chỉ **Python** (`.py`), dù `LANGUAGE_MAP` đã chuẩn bị theo plan.
+- Đổi mô hình node (`Symbol` → `Function`/`Class`/`Method`) cần **re-index full** (`POST .../reindex`).
 
-## Công cụ dev (optional)
+## Dev
 
 ```bash
 ruff check app
