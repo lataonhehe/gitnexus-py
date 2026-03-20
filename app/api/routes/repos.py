@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
+from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from neo4j import READ_ACCESS
 
 from app.api.deps import neo4j_driver_dep, settings_dep
@@ -30,10 +32,60 @@ from app.models.api import (
     slug_from_name,
 )
 from app.services.cypher_guard import validate_cypher
+from app.services.git_clone import (
+    clone_destination,
+    git_pull_ff,
+    prepare_git_worktree,
+    validate_git_url_for_clone,
+)
 from app.services.neo4j_json import json_cell
 from app.services.repo_schema import SCHEMA_RESOURCE
 
 router = APIRouter(prefix="/repos", tags=["repos"])
+
+_REPO_ROW_RETURN = """
+        r.id AS id, r.name AS name, r.root_path AS root_path,
+        r.git_url AS git_url, r.git_branch AS git_branch,
+        r.indexed_at AS indexed_at, r.head_commit AS head_commit, r.status AS status,
+        coalesce(r.file_count, 0) AS file_count,
+        coalesce(r.symbol_count, 0) AS symbol_count,
+        coalesce(r.edge_count, 0) AS edge_count
+"""
+
+
+def _remove_managed_clone(root_path: str, settings: Settings) -> None:
+    try:
+        p = Path(root_path).resolve()
+        base = (settings.data_dir.expanduser().resolve() / "clones").resolve()
+        if p.parent == base or base in p.parents:
+            shutil.rmtree(p, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _repo_row_for_index(driver, repo_id: str) -> dict[str, Any]:
+    rows = run_read(
+        driver,
+        """
+        MATCH (r:Repo {id: $id})
+        RETURN r.root_path AS root_path, r.git_url AS git_url, r.git_branch AS git_branch
+        LIMIT 1
+        """,
+        {"id": repo_id},
+    )
+    if not rows:
+        raise GitNexusError("REPO_NOT_FOUND", f"Repo '{repo_id}' not found", 404)
+    return rows[0]
+
+
+def _maybe_git_pull(row: dict[str, Any], pull: bool, settings: Settings) -> None:
+    if not pull or not row.get("git_url"):
+        return
+    root = Path(row["root_path"])
+    try:
+        git_pull_ff(root, settings)
+    except RuntimeError as e:
+        raise GitNexusError("GIT_PULL_FAILED", str(e), 502) from e
 
 
 def _require_repo(driver, repo_id: str) -> None:
@@ -56,6 +108,8 @@ def _row_to_repo_out(r: dict) -> RepoOut:
         id=r["id"],
         name=r["name"],
         root_path=r["root_path"],
+        git_url=r.get("git_url"),
+        git_branch=r.get("git_branch"),
         status=r.get("status"),
         indexed_at=r.get("indexed_at"),
         head_commit=r.get("head_commit"),
@@ -73,6 +127,8 @@ def _row_to_list_item(r: dict) -> RepoListItem:
         id=r["id"],
         name=r["name"],
         root_path=r["root_path"],
+        git_url=r.get("git_url"),
+        git_branch=r.get("git_branch"),
         status=r.get("status"),
         indexed_at=r.get("indexed_at"),
         head_commit=r.get("head_commit"),
@@ -83,36 +139,64 @@ def _row_to_list_item(r: dict) -> RepoListItem:
 @router.post("", response_model=RepoOut)
 def register_repo(
     body: RepoCreate,
+    settings: Annotated[Settings, Depends(settings_dep)],
     driver=Depends(neo4j_driver_dep),
 ):
-    try:
-        root = safe_repo_root(body.path)
-    except ValueError as e:
-        raise GitNexusError("INVALID_PATH", str(e), 400) from e
     rid = body.id or slug_from_name(body.name)
+    branch = (body.branch or "").strip() or None
+    git_url_norm: str | None = None
+    if body.git_url:
+        try:
+            git_url_norm = validate_git_url_for_clone(body.git_url, settings)
+        except ValueError as e:
+            raise GitNexusError("INVALID_GIT_URL", str(e), 400) from e
+        dest = clone_destination(rid, settings)
+        try:
+            prepare_git_worktree(
+                git_url_norm,
+                dest,
+                branch=branch,
+                settings=settings,
+                force_fresh_clone=body.force_clone,
+            )
+        except RuntimeError as e:
+            raise GitNexusError("GIT_CLONE_FAILED", str(e), 502) from e
+        root = str(dest.resolve())
+    else:
+        try:
+            root = str(safe_repo_root(body.path or ""))
+        except ValueError as e:
+            raise GitNexusError("INVALID_PATH", str(e), 400) from e
+        git_url_norm = None
+        branch = None
+
     rows = run_write_returning(
         driver,
-        """
-        MERGE (r:Repo {id: $id})
-        SET r.name = $name, r.root_path = $root_path, r.status = coalesce(r.status, 'registered')
-        RETURN r.id AS id, r.name AS name, r.root_path AS root_path,
-               r.indexed_at AS indexed_at, r.head_commit AS head_commit,
-               r.status AS status, r.file_count AS file_count,
-               r.symbol_count AS symbol_count, r.edge_count AS edge_count
+        f"""
+        MERGE (r:Repo {{id: $id}})
+        SET r.name = $name,
+            r.root_path = $root_path,
+            r.git_url = $git_url,
+            r.git_branch = $git_branch,
+            r.status = coalesce(r.status, 'registered')
+        RETURN {_REPO_ROW_RETURN.strip()}
         """,
-        {"id": rid, "name": body.name, "root_path": str(root)},
+        {
+            "id": rid,
+            "name": body.name,
+            "root_path": root,
+            "git_url": git_url_norm,
+            "git_branch": branch,
+        },
     )
     r = rows[0]
     if body.trigger_index:
         index_repository(driver, rid, str(root), full=True)
         rows2 = run_read(
             driver,
-            """
-            MATCH (r:Repo {id: $id})
-            RETURN r.id AS id, r.name AS name, r.root_path AS root_path,
-                   r.indexed_at AS indexed_at, r.head_commit AS head_commit,
-                   r.status AS status, r.file_count AS file_count,
-                   r.symbol_count AS symbol_count, r.edge_count AS edge_count
+            f"""
+            MATCH (r:Repo {{id: $id}})
+            RETURN {_REPO_ROW_RETURN.strip()}
             LIMIT 1
             """,
             {"id": rid},
@@ -126,14 +210,9 @@ def register_repo(
 def list_repos(driver=Depends(neo4j_driver_dep)):
     rows = run_read(
         driver,
-        """
+        f"""
         MATCH (r:Repo)
-        RETURN r.id AS id, r.name AS name, r.root_path AS root_path,
-               r.indexed_at AS indexed_at, r.head_commit AS head_commit,
-               r.status AS status,
-               coalesce(r.file_count, 0) AS file_count,
-               coalesce(r.symbol_count, 0) AS symbol_count,
-               coalesce(r.edge_count, 0) AS edge_count
+        RETURN {_REPO_ROW_RETURN.strip()}
         ORDER BY r.id
         """,
     )
@@ -144,14 +223,9 @@ def list_repos(driver=Depends(neo4j_driver_dep)):
 def get_repo(repo_id: str, driver=Depends(neo4j_driver_dep)):
     rows = run_read(
         driver,
-        """
-        MATCH (r:Repo {id: $id})
-        RETURN r.id AS id, r.name AS name, r.root_path AS root_path,
-               r.indexed_at AS indexed_at, r.head_commit AS head_commit,
-               r.status AS status,
-               coalesce(r.file_count, 0) AS file_count,
-               coalesce(r.symbol_count, 0) AS symbol_count,
-               coalesce(r.edge_count, 0) AS edge_count
+        f"""
+        MATCH (r:Repo {{id: $id}})
+        RETURN {_REPO_ROW_RETURN.strip()}
         LIMIT 1
         """,
         {"id": repo_id},
@@ -162,12 +236,23 @@ def get_repo(repo_id: str, driver=Depends(neo4j_driver_dep)):
 
 
 @router.delete("/{repo_id}")
-def delete_repo(repo_id: str, driver=Depends(neo4j_driver_dep)):
-    rows = run_read(driver, "MATCH (r:Repo {id: $id}) RETURN r.id AS id LIMIT 1", {"id": repo_id})
+def delete_repo(
+    repo_id: str,
+    settings: Annotated[Settings, Depends(settings_dep)],
+    driver=Depends(neo4j_driver_dep),
+):
+    rows = run_read(
+        driver,
+        "MATCH (r:Repo {id: $id}) RETURN r.id AS id, r.root_path AS root_path LIMIT 1",
+        {"id": repo_id},
+    )
     if not rows:
         raise GitNexusError("REPO_NOT_FOUND", f"Repo '{repo_id}' not found", 404)
+    root_path = rows[0].get("root_path")
     run_write(driver, "MATCH (n {repo_id: $id}) DETACH DELETE n", {"id": repo_id})
     run_write(driver, "MATCH (r:Repo {id: $id}) DETACH DELETE r", {"id": repo_id})
+    if root_path:
+        _remove_managed_clone(str(root_path), settings)
     return {"deleted": True, "id": repo_id}
 
 
@@ -175,30 +260,27 @@ def delete_repo(repo_id: str, driver=Depends(neo4j_driver_dep)):
 def run_index(
     repo_id: str,
     body: IndexRequest,
+    settings: Annotated[Settings, Depends(settings_dep)],
     driver=Depends(neo4j_driver_dep),
 ):
-    rows = run_read(
-        driver,
-        "MATCH (r:Repo {id: $id}) RETURN r.root_path AS root_path LIMIT 1",
-        {"id": repo_id},
-    )
-    if not rows:
-        raise GitNexusError("REPO_NOT_FOUND", f"Repo '{repo_id}' not found", 404)
-    root_path = rows[0]["root_path"]
-    return index_repository(driver, repo_id, root_path, full=body.full)
+    row = _repo_row_for_index(driver, repo_id)
+    _maybe_git_pull(row, body.pull, settings)
+    return index_repository(driver, repo_id, row["root_path"], full=body.full)
 
 
 @router.post("/{repo_id}/reindex")
-def reindex(repo_id: str, driver=Depends(neo4j_driver_dep)):
-    rows = run_read(
-        driver,
-        "MATCH (r:Repo {id: $id}) RETURN r.root_path AS root_path LIMIT 1",
-        {"id": repo_id},
-    )
-    if not rows:
-        raise GitNexusError("REPO_NOT_FOUND", f"Repo '{repo_id}' not found", 404)
-    root_path = rows[0]["root_path"]
-    return index_repository(driver, repo_id, root_path, full=True)
+def reindex(
+    repo_id: str,
+    settings: Annotated[Settings, Depends(settings_dep)],
+    driver=Depends(neo4j_driver_dep),
+    pull: bool = Query(
+        True,
+        description="If repo has git_url, run git pull --ff-only before full reindex",
+    ),
+):
+    row = _repo_row_for_index(driver, repo_id)
+    _maybe_git_pull(row, pull, settings)
+    return index_repository(driver, repo_id, row["root_path"], full=True)
 
 
 @router.get("/{repo_id}/schema")

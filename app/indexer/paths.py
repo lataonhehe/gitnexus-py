@@ -12,8 +12,12 @@ def safe_repo_root(raw: str) -> Path:
     p = Path(raw).expanduser().resolve()
     if not p.exists() or not p.is_dir():
         raise ValueError(f"Repository root is not a directory: {p}")
-    allow = get_settings().repo_roots_allowlist
+    settings = get_settings()
+    allow = settings.repo_roots_allowlist
     if allow:
+        clone_base = (settings.data_dir.expanduser().resolve() / "clones").resolve()
+        if p == clone_base or clone_base in p.parents:
+            return p
         roots = [Path(x).expanduser().resolve() for x in allow]
         if not any(p == r or r in p.parents for r in roots):
             raise ValueError(

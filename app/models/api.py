@@ -12,13 +12,26 @@ def slug_from_name(name: str) -> str:
 
 
 class RepoCreate(BaseModel):
-    """Register a repo (plan: path + name; optional explicit id)."""
+    """Register a repo: either local `path` or remote `git_url` (clone then index)."""
 
     name: str = Field(..., min_length=1, max_length=256)
-    path: str = Field(
-        ...,
+    path: str | None = Field(
+        default=None,
         validation_alias=AliasChoices("path", "root_path"),
-        description="Absolute or relative path to repository root",
+        description="Local filesystem path to repository root (mutually exclusive with git_url)",
+    )
+    git_url: str | None = Field(
+        default=None,
+        description="https(s) clone URL (GitHub, GitLab, …); cloned under server data/clones/{id}",
+    )
+    branch: str | None = Field(
+        default=None,
+        max_length=256,
+        description="Optional branch for git clone (default branch if omitted)",
+    )
+    force_clone: bool = Field(
+        default=False,
+        description="If true and git_url: delete existing worktree and clone fresh",
     )
     id: str | None = Field(
         default=None,
@@ -27,6 +40,16 @@ class RepoCreate(BaseModel):
         pattern=r"^[a-zA-Z0-9._-]+$",
     )
     trigger_index: bool = Field(default=True, description="Run full index after register")
+
+    @model_validator(mode="after")
+    def path_xor_git_url(self) -> RepoCreate:
+        p = (self.path or "").strip()
+        g = (self.git_url or "").strip()
+        if bool(p) == bool(g):
+            raise ValueError("Provide exactly one of: path (or root_path), or git_url")
+        object.__setattr__(self, "path", p or None)
+        object.__setattr__(self, "git_url", g or None)
+        return self
 
 
 class RepoStats(BaseModel):
@@ -39,6 +62,8 @@ class RepoListItem(BaseModel):
     id: str
     name: str
     root_path: str
+    git_url: str | None = None
+    git_branch: str | None = None
     status: str | None = None
     indexed_at: str | None = None
     head_commit: str | None = None
@@ -55,6 +80,8 @@ class RepoOut(BaseModel):
     id: str
     name: str
     root_path: str
+    git_url: str | None = None
+    git_branch: str | None = None
     status: str | None = None
     indexed_at: str | None = None
     head_commit: str | None = None
@@ -63,6 +90,10 @@ class RepoOut(BaseModel):
 
 class IndexRequest(BaseModel):
     full: bool = Field(default=True, description="If true, replace existing graph for this repo")
+    pull: bool = Field(
+        default=False,
+        description="If repo was registered with git_url, run git pull --ff-only before index",
+    )
 
 
 class CypherRequest(BaseModel):

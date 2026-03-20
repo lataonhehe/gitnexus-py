@@ -24,6 +24,7 @@ def get_repo_row(driver: Driver, repo_id: str) -> dict | None:
         """
         MATCH (r:Repo {id: $id})
         RETURN r.id AS id, r.name AS name, r.root_path AS root_path,
+               r.git_url AS git_url, r.git_branch AS git_branch,
                r.indexed_at AS indexed_at, r.head_commit AS head_commit,
                r.status AS status, r.file_count AS file_count,
                r.symbol_count AS symbol_count, r.edge_count AS edge_count

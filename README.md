@@ -16,10 +16,18 @@ pip install -e ".[dev]"
 ## Chạy Neo4j
 
 ```bash
+docker compose pull neo4j
 docker compose up -d neo4j
 ```
 
-Mặc định: Bolt `bolt://localhost:7687`, user `neo4j`, password `gitnexus-dev` (khớp `docker-compose.yml`).
+Image: **`neo4j:community`** (bản Community mới nhất). Xóa hẳn dữ liệu graph cũ (volume):
+
+```bash
+docker compose down -v
+docker compose up -d neo4j
+```
+
+`docker-compose.yml` trong repo có thể map Bolt/Browser sang cổng tùy chỉnh (ví dụ **7876** / **7321**); chỉnh `GITNEXUS_NEO4J_URI` / URL Browser cho khớp. Chạy Neo4j mặc định ngoài compose: Bolt `bolt://localhost:7687`, user `neo4j`, password theo `NEO4J_AUTH`.
 
 ## Cấu hình
 
@@ -50,13 +58,29 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ## Đăng ký và index (Phase 2–3)
 
+**Local path** (một trong hai: `path` **hoặc** `git_url`):
+
 ```bash
-# Đăng ký + index full (mặc định trigger_index=true). id slug từ name nếu không gửi id.
 curl -X POST http://localhost:8000/repos -H "Content-Type: application/json" ^
   -d "{\"name\":\"my-project\",\"path\":\"C:/path/to/repo\"}"
+```
 
+**Git URL** (server tự `git clone` shallow vào `DATA_DIR/clones/{repo_id}`, rồi index):
+
+```bash
+curl -X POST http://localhost:8000/repos -H "Content-Type: application/json" ^
+  -d "{\"name\":\"FastAPI\",\"git_url\":\"https://github.com/tiangolo/fastapi.git\",\"branch\":\"master\"}"
+```
+
+Tùy chọn: `force_clone: true` (xóa worktree cũ và clone lại), `trigger_index: false` (chỉ đăng ký).  
+Bảo mật: đặt `GITNEXUS_GIT_URL_ALLOWED_HOSTS` (CSV, hỗ trợ `*.gitlab.com`) trên môi trường team; URL chỉ `http`/`https`, chặn localhost/IP private trong URL.
+
+```bash
 curl http://localhost:8000/repos/my-project
-curl -X POST http://localhost:8000/repos/my-project/reindex
+curl -X POST "http://localhost:8000/repos/my-project/reindex"
+# Tắt git pull: POST .../reindex?pull=false
+curl -X POST http://localhost:8000/repos/my-project/index ^
+  -H "Content-Type: application/json" -d "{\"full\":true,\"pull\":true}"
 ```
 
 - `GET /repos` — `{ "repos": [ { id, name, root_path, status, stats: { file_count, symbol_count, edge_count }, ... } ] }`

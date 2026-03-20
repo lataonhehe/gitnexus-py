@@ -66,9 +66,28 @@ class Settings(BaseSettings):
 
     redis_url: str | None = Field(default=None, description="Optional, for future workers")
 
+    # Git URL → clone under DATA_DIR/clones/{repo_id}
+    git_clone_depth: int = Field(default=1, ge=1, le=500, description="git clone --depth")
+    git_clone_timeout_seconds: int = Field(
+        default=600,
+        ge=30,
+        le=7200,
+        description="Timeout for git clone/pull (seconds)",
+    )
+    git_binary: str = Field(default="git", description="git executable name/path")
+    git_url_allowed_hosts: list[str] = Field(
+        default_factory=list,
+        description="If non-empty, clone URL host must match (e.g. github.com, *.gitlab.com)",
+    )
+
     @field_validator("repo_roots_allowlist", mode="before")
     @classmethod
     def _split_allowlist(cls, v: str | list[str] | None) -> list[str]:
+        return _parse_allowlist(v)
+
+    @field_validator("git_url_allowed_hosts", mode="before")
+    @classmethod
+    def _split_git_hosts(cls, v: str | list[str] | None) -> list[str]:
         return _parse_allowlist(v)
 
 

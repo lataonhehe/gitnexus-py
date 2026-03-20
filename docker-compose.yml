@@ -1,19 +1,48 @@
 services:
-  neo4j:
-    image: neo4j:5.20-community
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "${API_PORT:-1349}:1349"
+    volumes:
+      - .:/app
+    env_file:
+      - .env
     environment:
-      NEO4J_AUTH: neo4j/gitnexus-dev
-      NEO4J_PLUGINS: '["apoc"]'
-      NEO4J_dbms_memory_heap_initial__size: "512m"
-      NEO4J_dbms_memory_heap_max__size: "1g"
+      NEO4J_URI: bolt://neo4j:7876
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: gitnexus-dev
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    restart: unless-stopped
+
+  neo4j:
+    # Official rolling tag: latest Community edition. Không cần giữ dữ liệu cũ:
+    #   docker compose down -v && docker compose pull && docker compose up -d
+    image: neo4j:community
+    ports:
+      - "7321:7321"  # HTTP / Browser
+      - "7876:7876"  # Bolt / Driver
+    environment:
+      - NEO4J_AUTH=neo4j/gitnexus-dev
+      - NEO4J_PLUGINS=["apoc"]
+      # Custom Port Configuration
+      - NEO4J_dbms_connector_http_listen__address=:7321
+      - NEO4J_dbms_connector_http_advertised__address=:7321
+      - NEO4J_dbms_connector_bolt_listen__address=:7876
+      - NEO4J_dbms_connector_bolt_advertised__address=:7876
+      # Memory Management
+      - NEO4J_server_memory_heap_initial__size=512m
+      - NEO4J_server_memory_heap_max__size=1g
     volumes:
       - neo4j_data:/data
     healthcheck:
       test: ["CMD", "neo4j", "status"]
       interval: 10s
+      timeout: 5s
       retries: 5
 
   redis:
